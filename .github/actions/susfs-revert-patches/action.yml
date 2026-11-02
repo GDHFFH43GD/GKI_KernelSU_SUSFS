@@ -64,9 +64,11 @@ runs:
           echo "Reverting base.c Android 14 6.1 Fake Patch"
           sed -i '/^#include <linux\/dma-buf.h>$/d' fs/proc/base.c
         fi
-        if [ "${{ inputs.sublevel }}" -ge "157" ]; then
+        if grep -q '<trace/hooks/blk.h>' fs/namespace.c; then
           echo "Reverting namespace.c Android 14 6.1 Fake Patch"
-          sed -i '/^#include "internal.h"$/a #include <trace/hooks/blk.h>' fs/namespace.c
+          sed -i '/^#include <trace\/hooks\/blk.h>$/d' fs/namespace.c
+        fi
+        if [ "${{ inputs.sublevel }}" -ge "157" ]; then
           echo "Reverting super.c Android 14 6.1 Fake Patch"
           sed -i '/^#include "internal.h"$/a #include <trace/hooks/fs.h>' fs/super.c
         fi

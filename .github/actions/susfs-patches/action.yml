@@ -96,9 +96,11 @@ runs:
           echo "Applying base.c Android 14 6.1 Fake Patch"
           sed -i '/^#include <linux\/cpufreq_times.h>$/a #include <linux/dma-buf.h>' fs/proc/base.c
         fi
+        if ! grep -q '<trace/hooks/blk.h>' fs/namespace.c; then
+          echo "Applying namespace.c trace/hooks/blk.h Fake Header for SUSFS patch context"
+          sed -i '/^#include "internal.h"$/a #include <trace/hooks/blk.h>' fs/namespace.c
+        fi
         if [ "${{ inputs.sublevel }}" -ge "157" ]; then
-          echo "Applying namespace.c Android 14 6.1 Fake Patch"
-          sed -i '/^#include <trace\/hooks\/blk.h>$/d' fs/namespace.c
           echo "Applying super.c Android 14 6.1 Fake Patch"
           sed -i '/^#include <trace\/hooks\/fs.h>$/,+1 d' fs/super.c
         fi
