@@ -647,27 +647,6 @@ jobs:
           fi
         } > "$SUMMARY_FILE"
 
-    - name: Package Tether Optimizer into AnyKernel3
-      shell: bash
-      run: |
-        if [ -d "${{ github.workspace }}/AnyKernel3" ]; then
-          cp -f "${{ github.workspace }}/.github/scripts/tether_optimizer.sh" "${{ github.workspace }}/AnyKernel3/tether_optimizer.sh"
-          chmod +x "${{ github.workspace }}/AnyKernel3/tether_optimizer.sh"
-          if [ -f "${{ github.workspace }}/AnyKernel3/anykernel.sh" ]; then
-            if ! grep -q "tether_optimizer.sh" "${{ github.workspace }}/AnyKernel3/anykernel.sh"; then
-              {
-                echo ""
-                echo "# Install Tether Optimizer & Wire-Speed VPN Forwarder"
-                echo "if [ -d /data/adb/service.d ]; then"
-                echo "  ui_print \"  • Installing Tether Optimizer service...\""
-                echo "  cp -f \$home/tether_optimizer.sh /data/adb/service.d/99-tether-optimizer.sh"
-                echo "  chmod 0755 /data/adb/service.d/99-tether-optimizer.sh"
-                echo "fi"
-              } >> "${{ github.workspace }}/AnyKernel3/anykernel.sh"
-            fi
-          fi
-        fi
-
     - name: Upload Artifacts
       id: kernel-artifact
       uses: actions/upload-artifact@v7

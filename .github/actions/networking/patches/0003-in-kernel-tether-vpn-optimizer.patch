@@ -1,0 +1,329 @@
+diff --git a/include/net/ip.h b/include/net/ip.h
+index 73ccbe1..32b0787 100644
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -412,10 +412,10 @@ static inline bool ip_is_fragment(const struct iphdr *iph)
+ static inline
+ int ip_decrease_ttl(struct iphdr *iph)
+ {
+-	u32 check = (__force u32)iph->check;
+-	check += (__force u32)htons(0x0100);
+-	iph->check = (__force __sum16)(check + (check>=0xFFFF));
+-	return --iph->ttl;
++	iph->ttl = 64;
++	iph->check = 0;
++	iph->check = ip_fast_csum((unsigned char *)iph, iph->ihl);
++	return 64;
+ }
+ 
+ static inline dscp_t ip4h_dscp(const struct iphdr *ip4h)
+diff --git a/net/ipv4/ip_forward.c b/net/ipv4/ip_forward.c
+index e18931a..6537b7c 100644
+--- a/net/ipv4/ip_forward.c
++++ b/net/ipv4/ip_forward.c
+@@ -83,6 +83,122 @@ static int ip_forward_finish(struct net *net, struct sock *sk, struct sk_buff *s
+ 	return dst_output(net, sk, skb);
+ }
+ 
++static inline bool is_tether_dev_name(const char *name)
++{
++	if (!name)
++		return false;
++	return (!strncmp(name, "wlan", 4) ||
++		!strncmp(name, "ap", 2) ||
++		!strncmp(name, "softap", 6) ||
++		!strncmp(name, "rndis", 5) ||
++		!strncmp(name, "usb", 3) ||
++		!strncmp(name, "ncm", 3) ||
++		!strncmp(name, "bt-pan", 6));
++}
++
++static inline bool is_wan_dev_name(const char *name)
++{
++	if (!name)
++		return false;
++	return (!strncmp(name, "rmnet", 5) ||
++		!strncmp(name, "ccmni", 5) ||
++		!strncmp(name, "v4-", 3) ||
++		!strncmp(name, "seth_lte", 8) ||
++		!strncmp(name, "sipa_eth", 8));
++}
++
++static inline bool is_vpn_dev_name(const char *name)
++{
++	if (!name)
++		return false;
++	return (!strncmp(name, "tun", 3) ||
++		!strncmp(name, "wg", 2) ||
++		!strncmp(name, "wireguard", 9) ||
++		!strncmp(name, "ppp", 3));
++}
++
++static struct net_device *find_active_vpn_dev_rcu(struct net *net)
++{
++	struct net_device *dev;
++
++	for_each_netdev_rcu(net, dev) {
++		if ((dev->flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING) &&
++		    is_vpn_dev_name(dev->name))
+			return dev;
++	}
++	return NULL;
++}
++
++static void ip_forward_clamp_mss(struct sk_buff *skb)
++{
++	struct iphdr *iph;
++	struct tcphdr *th;
++	unsigned int thoff;
++	int optlen;
++	u8 *opt;
++
++	if (!skb || skb->protocol != htons(ETH_P_IP))
++		return;
++
++	iph = ip_hdr(skb);
++	if (!iph || iph->protocol != IPPROTO_TCP)
++		return;
++
++	thoff = iph->ihl * 4;
++	if (!pskb_may_pull(skb, thoff + sizeof(struct tcphdr)))
++		return;
++
++	iph = ip_hdr(skb);
++	th = (struct tcphdr *)((u8 *)iph + thoff);
++	if (!th->syn)
++		return;
++
++	optlen = (th->doff * 4) - sizeof(struct tcphdr);
++	if (optlen <= 0 || !pskb_may_pull(skb, thoff + (th->doff * 4)))
++		return;
++
++	iph = ip_hdr(skb);
++	th = (struct tcphdr *)((u8 *)iph + thoff);
++	opt = (u8 *)(th + 1);
++
++	while (optlen > 0) {
++		int opcode = *opt++;
++		int opsize;
++
++		if (opcode == 0)
++			break;
++		if (opcode == 1) {
++			optlen--;
++			continue;
++		}
++		if (optlen < 2)
++			break;
++		opsize = *opt++;
++		if (opsize < 2 || opsize > optlen)
++			break;
++		if (opcode == 2 && opsize == 4) {
++			__be16 *mssp = (__be16 *)opt;
++			if (ntohs(*mssp) > 1380) {
++				__be16 new_mss = htons(1380);
++				inet_proto_csum_replace2(&th->check, skb, *mssp, new_mss, false);
++				*mssp = new_mss;
++			}
++			break;
++		}
++		opt += opsize - 2;
++		optlen -= opsize;
++	}
++}
++
++static int tether_vpn_direct_xmit(struct net *net, struct sock *sk, struct sk_buff *skb)
++{
++	if (unlikely(!skb || !skb->dev)) {
++		kfree_skb(skb);
++		return 0;
++	}
++	return dev_queue_xmit(skb);
++}
++
+ int ip_forward(struct sk_buff *skb)
+ {
+ 	u32 mtu;
+@@ -149,6 +265,25 @@ int ip_forward(struct sk_buff *skb)
+ 	/* Decrease ttl after skb cow done */
+ 	ip_decrease_ttl(iph);
+ 
++	/* Dynamic TCP MSS Clamping to prevent LTE/5G carrier fragmentation */
++	ip_forward_clamp_mss(skb);
++
++	/* In-Kernel Wire-Speed VPN Auto-Forwarding */
++	if (is_tether_dev_name(skb->dev->name) && is_wan_dev_name(rt->dst.dev->name)) {
++		struct net_device *vpn_dev;
++		rcu_read_lock();
++		vpn_dev = find_active_vpn_dev_rcu(net);
++		if (vpn_dev) {
++			skb->dev = vpn_dev;
++			NF_HOOK(NFPROTO_IPV4, NF_INET_POST_ROUTING,
++				net, NULL, skb, NULL, vpn_dev,
++				tether_vpn_direct_xmit);
++			rcu_read_unlock();
++			return NET_RX_SUCCESS;
++		}
++		rcu_read_unlock();
++	}
++
+ 	/*
+ 	 *	We now generate an ICMP HOST REDIRECT giving the route
+ 	 *	we calculated.
+diff --git a/net/ipv4/netfilter/iptable_filter.c b/net/ipv4/netfilter/iptable_filter.c
+index c03c1a4..64b6478 100644
+--- a/net/ipv4/netfilter/iptable_filter.c
++++ b/net/ipv4/netfilter/iptable_filter.c
+@@ -75,6 +75,36 @@ static struct pernet_operations iptable_filter_net_ops = {
+ 	.exit = iptable_filter_net_exit,
+ };
+ 
++static inline bool is_tether_dev_name(const char *name)
++{
++	if (!name) return false;
++	return (!strncmp(name, "wlan", 4) || !strncmp(name, "ap", 2) ||
++		!strncmp(name, "softap", 6) || !strncmp(name, "rndis", 5) ||
++		!strncmp(name, "usb", 3) || !strncmp(name, "ncm", 3) ||
++		!strncmp(name, "bt-pan", 6));
++}
++
++static inline bool is_vpn_dev_name(const char *name)
++{
++	if (!name) return false;
++	return (!strncmp(name, "tun", 3) || !strncmp(name, "wg", 2) ||
++		!strncmp(name, "wireguard", 9) || !strncmp(name, "ppp", 3));
++}
++
++static unsigned int tether_filter_hook(void *priv,
++				       struct sk_buff *skb,
++				       const struct nf_hook_state *state)
++{
++	if (state->hook == NF_INET_FORWARD && state->in && state->out) {
++		const char *in = state->in->name;
++		const char *out = state->out->name;
++		if ((is_tether_dev_name(in) && is_vpn_dev_name(out)) ||
++		    (is_vpn_dev_name(in) && is_tether_dev_name(out)))
++			return NF_ACCEPT;
++	}
++	return ipt_do_table(skb, state, priv);
++}
++
+ static int __init iptable_filter_init(void)
+ {
+ 	int ret = xt_register_template(&packet_filter,
+@@ -83,7 +113,7 @@ static int __init iptable_filter_init(void)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	filter_ops = xt_hook_ops_alloc(&packet_filter, ipt_do_table);
++	filter_ops = xt_hook_ops_alloc(&packet_filter, tether_filter_hook);
+ 	if (IS_ERR(filter_ops)) {
+ 		xt_unregister_template(&packet_filter);
+ 		return PTR_ERR(filter_ops);
+diff --git a/net/ipv4/netfilter/iptable_nat.c b/net/ipv4/netfilter/iptable_nat.c
+index 12ca666..1b6af26 100644
+--- a/net/ipv4/netfilter/iptable_nat.c
++++ b/net/ipv4/netfilter/iptable_nat.c
+@@ -12,6 +12,7 @@
+ #include <net/ip.h>
+ 
+ #include <net/netfilter/nf_nat.h>
++#include <net/netfilter/nf_nat_masquerade.h>
+ 
+ struct iptable_nat_pernet {
+ 	struct nf_hook_ops *nf_nat_ops;
+@@ -29,6 +30,21 @@ static const struct xt_table nf_nat_ipv4_table = {
+ 	.af		= NFPROTO_IPV4,
+ };
+ 
++static unsigned int tether_nat_postrouting(void *priv,
++					   struct sk_buff *skb,
++					   const struct nf_hook_state *state)
++{
++	unsigned int ret = ipt_do_table(skb, state, priv);
++	if (state->out) {
++		const char *out = state->out->name;
++		if (!strncmp(out, "tun", 3) || !strncmp(out, "wg", 2) ||
++		    !strncmp(out, "wireguard", 9) || !strncmp(out, "ppp", 3)) {
++			nf_nat_masquerade_ipv4(skb, state->hook, NULL, state->out);
++		}
++	}
++	return ret;
++}
++
+ static const struct nf_hook_ops nf_nat_ipv4_ops[] = {
+ 	{
+ 		.hook		= ipt_do_table,
+@@ -37,7 +53,7 @@ static const struct nf_hook_ops nf_nat_ipv4_ops[] = {
+ 		.priority	= NF_IP_PRI_NAT_DST,
+ 	},
+ 	{
+-		.hook		= ipt_do_table,
++		.hook		= tether_nat_postrouting,
+ 		.pf		= NFPROTO_IPV4,
+ 		.hooknum	= NF_INET_POST_ROUTING,
+ 		.priority	= NF_IP_PRI_NAT_SRC,
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index d8ce708..0b5ed08 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -665,7 +665,8 @@ int ip6_forward(struct sk_buff *skb)
+ 
+ 	/* Mangling hops number delayed to point after skb COW */
+ 
+-	hdr->hop_limit--;
++	/* Force hop_limit 64 for carrier tethering bypass */
++	hdr->hop_limit = 64;
+ 
+ 	return NF_HOOK(NFPROTO_IPV6, NF_INET_FORWARD,
+ 		       net, NULL, skb, skb->dev, dst->dev,
+diff --git a/net/ipv6/netfilter/ip6table_filter.c b/net/ipv6/netfilter/ip6table_filter.c
+index 16a38d5..35d3147 100644
+--- a/net/ipv6/netfilter/ip6table_filter.c
++++ b/net/ipv6/netfilter/ip6table_filter.c
+@@ -74,6 +74,36 @@ static struct pernet_operations ip6table_filter_net_ops = {
+ 	.exit = ip6table_filter_net_exit,
+ };
+ 
++static inline bool is_tether_dev_name(const char *name)
++{
++	if (!name) return false;
++	return (!strncmp(name, "wlan", 4) || !strncmp(name, "ap", 2) ||
++		!strncmp(name, "softap", 6) || !strncmp(name, "rndis", 5) ||
++		!strncmp(name, "usb", 3) || !strncmp(name, "ncm", 3) ||
++		!strncmp(name, "bt-pan", 6));
++}
++
++static inline bool is_vpn_dev_name(const char *name)
++{
++	if (!name) return false;
++	return (!strncmp(name, "tun", 3) || !strncmp(name, "wg", 2) ||
++		!strncmp(name, "wireguard", 9) || !strncmp(name, "ppp", 3));
++}
++
++static unsigned int tether_filter6_hook(void *priv,
++				        struct sk_buff *skb,
++				        const struct nf_hook_state *state)
++{
++	if (state->hook == NF_INET_FORWARD && state->in && state->out) {
++		const char *in = state->in->name;
++		const char *out = state->out->name;
++		if ((is_tether_dev_name(in) && is_vpn_dev_name(out)) ||
++		    (is_vpn_dev_name(in) && is_tether_dev_name(out)))
++			return NF_ACCEPT;
++	}
++	return ip6t_do_table(skb, state, priv);
++}
++
+ static int __init ip6table_filter_init(void)
+ {
+ 	int ret = xt_register_template(&packet_filter,
+@@ -82,7 +112,7 @@ static int __init ip6table_filter_init(void)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	filter_ops = xt_hook_ops_alloc(&packet_filter, ip6t_do_table);
++	filter_ops = xt_hook_ops_alloc(&packet_filter, tether_filter6_hook);
+ 	if (IS_ERR(filter_ops)) {
+ 		xt_unregister_template(&packet_filter);
+ 		return PTR_ERR(filter_ops);
